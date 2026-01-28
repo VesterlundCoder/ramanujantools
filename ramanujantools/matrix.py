@@ -29,6 +29,9 @@ def _rt_walk_fallback_dps() -> int:
     try:
         return int(os.environ.get("RT_WALK_FALLBACK_DPS", "200"))
     except Exception:
+        if os.environ.get("RT_WALK_DEBUG", "0") == "1":
+    print("[ramanujantools] Matrix._walk_inner: USING MPMATH FALLBACK")
+
         return 200
 
 
