@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from functools import lru_cache, cached_property
+import os
 
 import numpy as np
 import mpmath as mp
@@ -14,6 +15,151 @@ from ramanujantools.flint_core import flint_ctx, SymbolicMatrix, NumericMatrix
 
 if TYPE_CHECKING:
     from ramanujantools import Limit
+
+
+# ============================================================
+# Walk fallback (Flint -> mpmath) to handle rf/RisingFactorial
+# ============================================================
+
+def _rt_walk_fallback_dps() -> int:
+    """
+    Digits of precision used by the numeric fallback.
+    Set env var: RT_WALK_FALLBACK_DPS=200 (default 200).
+    """
+    try:
+        return int(os.environ.get("RT_WALK_FALLBACK_DPS", "200"))
+    except Exception:
+        return 200
+
+
+def _sympy_to_mpf(x: sp.Expr) -> mp.mpf:
+    """
+    Robust sympy-number -> mp.mpf conversion without losing rationals.
+    """
+    # Fast paths
+    if isinstance(x, (int, float)):
+        return mp.mpf(x)
+    if isinstance(x, sp.Integer):
+        return mp.mpf(int(x))
+    if isinstance(x, sp.Rational):
+        return mp.mpf(int(x.p)) / mp.mpf(int(x.q))
+
+    # Generic: evaluate to string at current dps
+    dps = mp.mp.dps
+    try:
+        return mp.mpf(str(sp.N(x, dps)))
+    except Exception:
+        return mp.mpf(str(x))
+
+
+def _rewrite_specials_for_mpmath(expr: sp.Expr) -> sp.Expr:
+    """
+    Rewrite functions that can break some eval paths into gamma ratios
+    so that lambdify(modules=['mpmath']) works.
+      RisingFactorial(a,n) / rf(a,n) -> gamma(a+n)/gamma(a)
+    """
+    # RisingFactorial class
+    try:
+        RF = sp.functions.combinatorial.factorials.RisingFactorial
+        expr = expr.replace(RF, lambda a, nn: sp.gamma(a + nn) / sp.gamma(a))
+    except Exception:
+        pass
+
+    # sympy.rf function (older/newer sympy variants)
+    if hasattr(sp, "rf"):
+        try:
+            expr = expr.replace(sp.rf, lambda a, nn: sp.gamma(a + nn) / sp.gamma(a))
+        except Exception:
+            pass
+
+    # Keep expression reasonably compact for lambdify
+    try:
+        expr = sp.together(expr)
+    except Exception:
+        pass
+
+    return expr
+
+
+def _mpmath_walk_matrix(
+    sympy_mat: sp.Matrix,
+    trajectory: Position,
+    iterations: list[int],
+    start: Position,
+) -> list["Matrix"]:
+    """
+    Numeric fallback for walk:
+      Π_{i=0}^{n-1} M(start + i*trajectory)
+    Returns list of RT Matrices at requested checkpoints (iterations).
+    """
+    checkpoints = sorted(iterations)
+    if not checkpoints:
+        return []
+
+    dps = _rt_walk_fallback_dps()
+    mp.mp.dps = dps
+
+    dim = sympy_mat.rows
+    nmax = checkpoints[-1]
+
+    # Build a single lambdify for all entries
+    keys = list(start.keys())  # sympy symbols/expressions used as keys
+    flat_exprs = []
+    for i in range(dim):
+        for j in range(dim):
+            flat_exprs.append(_rewrite_specials_for_mpmath(sympy_mat[i, j]))
+
+    f = sp.lambdify(keys, flat_exprs, modules=["mpmath"])
+
+    # Identity product
+    P = mp.matrix(dim)
+    for i in range(dim):
+        for j in range(dim):
+            P[i, j] = mp.mpf(1) if i == j else mp.mpf(0)
+
+    out: list[Matrix] = []
+    ck_idx = 0
+
+    # If iteration 0 requested, return identity immediately
+    if checkpoints and checkpoints[0] == 0:
+        I = sp.eye(dim)
+        out.append(Matrix(I))
+        ck_idx = 1
+        if ck_idx >= len(checkpoints):
+            return out
+
+    def coords(t: int):
+        vals = []
+        for s in keys:
+            expr = start[s] + t * trajectory[s]
+            vals.append(_sympy_to_mpf(expr))
+        return vals
+
+    # Multiply step-by-step, collect at checkpoints
+    for t in range(nmax):
+        vals = coords(t)
+        ev = f(*vals)  # flat list, length dim*dim
+
+        Mnum = mp.matrix(dim)
+        it = 0
+        for i in range(dim):
+            for j in range(dim):
+                Mnum[i, j] = mp.mpf(ev[it])
+                it += 1
+
+        P = P * Mnum
+
+        # checkpoints are in "iterations" units: after t+1 multiplications
+        while ck_idx < len(checkpoints) and (t + 1) == checkpoints[ck_idx]:
+            # Convert mp.matrix -> sympy Matrix of Floats (keep precision)
+            data = []
+            for i in range(dim):
+                for j in range(dim):
+                    data.append(sp.Float(str(P[i, j]), dps))
+            out.append(Matrix(sp.Matrix(dim, dim, data)))
+            ck_idx += 1
+
+    return out
 
 
 class Matrix(sp.Matrix):
@@ -259,17 +405,26 @@ class Matrix(sp.Matrix):
         """
         Internal walk function, used for type conversions and for caching. Do not use directly.
         """
-        iterations = list(iterations)
-        if self._is_numeric_walk(trajectory, start):
-            results = NumericMatrix.walk(self, trajectory, iterations, start)
-            return [result.to_rt() for result in results]
-        else:
-            symbols = self.walk_free_symbols(start)
-            as_flint = SymbolicMatrix.from_sympy(
-                self, flint_ctx(symbols, fmpz=start.is_polynomial())
-            )
-            results = as_flint.walk(trajectory, iterations, start)
-            return [result.factor() for result in results]
+        iterations_list = list(iterations)
+
+        # Try fast paths (Flint/NumericMatrix) first; fall back to mpmath if anything breaks.
+        try:
+            if self._is_numeric_walk(trajectory, start):
+                results = NumericMatrix.walk(self, trajectory, iterations_list, start)
+                return [result.to_rt() for result in results]
+            else:
+                symbols = self.walk_free_symbols(start)
+                as_flint = SymbolicMatrix.from_sympy(
+                    self, flint_ctx(symbols, fmpz=start.is_polynomial())
+                )
+                results = as_flint.walk(trajectory, iterations_list, start)
+                return [result.factor() for result in results]
+
+        except Exception:
+            # Numeric fallback: evaluate and multiply with mpmath, supports rf/RisingFactorial via gamma rewrite.
+            # If the matrix still has genuinely unassigned symbols, this will raise during lambdify/eval.
+            sympy_mat = sp.Matrix(self)  # ensure plain sympy Matrix
+            return _mpmath_walk_matrix(sympy_mat, trajectory, iterations_list, start)
 
     @batched("iterations")
     def walk(
